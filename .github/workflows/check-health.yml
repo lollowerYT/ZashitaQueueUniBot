@@ -1,0 +1,15 @@
+name: Bot health check
+on:
+  schedule:
+    - cron: '3-59/10 * * * *'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check bot endpoint
+        run: |
+          status=$(curl --silent --show-error --head --output /dev/null --write-out '%{http_code}' --retry 2 --max-time 60 https://zashitaqueueunibot.onrender.com/health)
+          test "$status" = 204
