@@ -2,6 +2,9 @@ name: Bot health check
 on:
   schedule:
     - cron: '3-59/10 * * * *'
+  push:
+    paths:
+      - '.github/workflows/check-health.yml'
   workflow_dispatch:
 permissions: {}
 jobs:
