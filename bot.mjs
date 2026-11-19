@@ -1,11 +1,15 @@
 import {readFileSync, writeFileSync, renameSync, existsSync} from 'node:fs';
-import {randomInt, randomUUID} from 'node:crypto';
+import {createHmac, randomInt, randomUUID} from 'node:crypto';
 import {setTimeout as sleep} from 'node:timers/promises';
 
 import {createServer} from 'node:http';
 
-function startHealthServer(port) {
+function startHealthServer(port, webhookHandler) {
   const server = createServer((req, res) => {
+    if (webhookHandler && req.method==='POST' && req.url==='/telegram') {
+      webhookHandler(req,res).catch(()=>{if (!res.headersSent) res.writeHead(503);res.end();});
+      return;
+    }
     const healthy = req.url === '/health' && ['GET', 'HEAD'].includes(req.method);
     res.writeHead(healthy ? 204 : 404, {'Cache-Control': 'no-store'});
     res.end();
@@ -63,6 +67,7 @@ async function api(method, data={}) {
   });
   const body = await res.json();
   if (!body.ok) {
+    if (method==='answerCallbackQuery' && body.error_code===400 && /query is too old|query id is invalid/i.test(body.description)) return;
     if (body.parameters?.retry_after) await sleep(body.parameters.retry_after*1000);
     throw Object.assign(Error(body.description),{code:body.error_code});
   }
@@ -84,7 +89,8 @@ while (!me) {
   }
 }
 if (token !== process.env.BOT_TOKEN) writeFileSync(tokenFile,token,{mode:0o600});
-if (process.env.PORT) startHealthServer(process.env.PORT);
+const hosted = Boolean(process.env.RENDER_EXTERNAL_URL && process.env.DATABASE_URL);
+if (process.env.PORT && !hosted) startHealthServer(process.env.PORT);
 console.log('Бот работает: @'+me.username);
 const clean = s => String(s || '').replace(/[\p{C}\s]+/gu,' ').trim().slice(0,100);
 const help = 'В группе отправьте /open для записи и /close для жеребьёвки. Чтобы указать фамилию и имя, нажмите «Заполнить профиль».';
@@ -429,6 +435,9 @@ async function handle(update) {
     return personal('👤 Мои данные\n'+info+'Напишите фамилию и имя одним сообщением.');
   }
   if (priv && (cmd==='/start' || cmd==='/help' || input==='🏠 Старт')) {
+    if(update.message && cmd==='/start') {
+      const state=privateState(uid);await removePrivate(uid,state.panel);delete state.panel;
+    }
     delete db.pending[uid];if(draft) delete draft.field;await save();
     return personal('🎓 Главное меню\n\n👤 Мои данные — изменить профиль для защиты.\n📚 Предметы — настроить расписание и преподавателей.');
   }
@@ -563,29 +572,63 @@ try {
     {command:'close',description:'Закрыть запись и показать результат'}
   ]});
 } catch(e){console.error('Меню команд:',e.message);}
-while (true) {
+async function processUpdate(update) {
   try {
-    try {await tick();} catch(e){console.error('Расписание:',e.message);}
-    const updates = await api('getUpdates',{offset:db.offset,timeout:10,allowed_updates:['message','callback_query']});
-    for (const update of updates) {
-      try {
-        const incoming=update.message;
-        const privateMessage=incoming?.chat.type==='private';
-        if(privateMessage && /^\/start(?:@\w+)?(?:\s|$)/i.test(incoming.text || '')) {
-          privateState(incoming.chat.id).firstStart ??=incoming.message_id;
-          await save();
-        }
-        await handle(update);
-        if(privateMessage) await removePrivate(incoming.chat.id,incoming.message_id);
-      }
-      catch (e) {if (![400,403].includes(e.code)) throw e; console.error(e.message);}
-      db.offset=update.update_id+1;
+    const incoming=update.message;
+    const privateMessage=incoming?.chat.type==='private';
+    if(privateMessage && /^\/start(?:@\w+)?(?:\s|$)/i.test(incoming.text || '')) {
+      privateState(incoming.chat.id).firstStart ??=incoming.message_id;
       await save();
     }
-  } catch (e) {console.error(e.message);await sleep(3000);}
+    await handle(update);
+    if(privateMessage) await removePrivate(incoming.chat.id,incoming.message_id);
+  }
+  catch (e) {if (![400,403].includes(e.code)) throw e; console.error(e.message);}
+
+  db.offset=update.update_id+1;
+  await save();
 }
-
-
-
-
-
+if (hosted) {
+  const secret=createHmac('sha256',token).update('telegram-webhook-v1').digest('hex');
+  let tail=Promise.resolve();
+  function enqueue(task) {
+    const run=tail.then(task);
+    tail=run.catch(()=>{});
+    return run;
+  }
+  async function receive(req,res) {
+    if(req.headers['x-telegram-bot-api-secret-token']!==secret) {res.writeHead(403).end();return;}
+    const chunks=[];let size=0;
+    for await(const chunk of req) {
+      size+=chunk.length;
+      if(size>1024*1024) {res.writeHead(413).end();return;}
+      chunks.push(chunk);
+    }
+    const update=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    await enqueue(async()=>{
+      if(db.lastWebhookUpdate!==update.update_id) {
+        await processUpdate(update);
+        db.lastWebhookUpdate=update.update_id;
+        await save();
+        console.log('Telegram update processed:',update.callback_query?'button':'message');
+      }
+    });
+    res.writeHead(200).end();
+  }
+  const server=startHealthServer(process.env.PORT,receive);
+  await new Promise((resolve,reject)=>{server.once('listening',resolve);server.once('error',reject);});
+  await api('setWebhook',{url:new URL('/telegram',process.env.RENDER_EXTERNAL_URL).href,secret_token:secret,max_connections:1,allowed_updates:['message','callback_query']});
+  console.log('Telegram webhook active');
+  for (;;) {
+    await enqueue(tick).catch(e=>console.error('Расписание:',e.message));
+    await sleep(10000);
+  }
+} else {
+  while(true) {
+    try {
+      await tick().catch(e=>console.error('Расписание:',e.message));
+      const updates=await api('getUpdates',{offset:db.offset,timeout:10,allowed_updates:['message','callback_query']});
+      for(const update of updates) await processUpdate(update);
+    } catch(e){console.error(e.message);await sleep(3000);}
+  }
+}
