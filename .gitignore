@@ -1,0 +1,6 @@
+.bot-token
+.env*
+queue.json
+queue.tmp
+*.zip
+node_modules/
