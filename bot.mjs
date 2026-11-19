@@ -15,7 +15,24 @@ function startHealthServer(port) {
 
 const path = new URL('queue.json', import.meta.url);
 const tmp = new URL('queue.tmp', import.meta.url);
-let db = existsSync(path) ? JSON.parse(readFileSync(path,'utf8')) : {rooms:{}, profiles:{}, offset:0};
+let db;
+let pool;
+let revision;
+const emptyState = () => ({rooms:{}, profiles:{}, offset:0});
+if (process.env.DATABASE_URL) {
+  const {Pool} = await import('pg');
+  pool = new Pool({connectionString:process.env.DATABASE_URL,max:1});
+  await pool.query('CREATE TABLE IF NOT EXISTS bot_state (id integer PRIMARY KEY, version bigint NOT NULL, data jsonb NOT NULL)');
+  const seed = process.env.QUEUE_SEED_FILE;
+  const initial = seed ? JSON.parse(readFileSync(seed,'utf8')) : emptyState();
+  await pool.query('INSERT INTO bot_state VALUES (1,0,$1) ON CONFLICT DO NOTHING',[initial]);
+  const {rows} = await pool.query('SELECT data, version FROM bot_state WHERE id=1');
+  db = rows[0].data;
+  revision = rows[0].version;
+} else {
+  if (process.env.RENDER) throw Error('Для Render задайте DATABASE_URL.');
+  db = existsSync(path) ? JSON.parse(readFileSync(path,'utf8')) : emptyState();
+}
 const tokenFile = new URL('.bot-token', import.meta.url);
 let token = process.env.BOT_TOKEN?.trim() || (existsSync(tokenFile) ? readFileSync(tokenFile,'utf8').trim() : '');
 async function askToken() {
@@ -24,7 +41,18 @@ async function askToken() {
   try { return (await terminal.question('Вставьте токен от BotFather и нажмите Enter: ')).trim(); }
   finally { terminal.close(); }
 }
-function save() {
+async function save() {
+  if (pool) {
+    try {
+      const {rows} = await pool.query('UPDATE bot_state SET data=$1, version=version+1 WHERE id=1 AND version=$2 RETURNING version',[db,revision]);
+      if (!rows.length) throw Error('Состояние уже изменено другим процессом.');
+      revision=rows[0].version;
+    } catch {
+      console.error('Не удалось сохранить актуальную версию очереди. Перезапуск нужен для повторного чтения базы.');
+      process.exit(1);
+    }
+    return;
+  }
   writeFileSync(tmp, JSON.stringify(db));
   renameSync(tmp,path);
 }
@@ -123,7 +151,7 @@ async function panel(uid,text,rows=[],restore=false) {
     }
   }
   const sent=await api('sendMessage',payload);
-  state.panel=sent.message_id;save();
+  state.panel=sent.message_id;await save();
   return sent;
 }
 function menu(d,text,rows) {return panel(d.uid,text,rows);}
@@ -198,12 +226,12 @@ function shortDate(input) {
   }
   return null;
 }
-function saveSubject(d) {
+async function saveSubject(d) {
   if (!d.subject || !d.time || !Number.isInteger(d.weekday) || !d.teachers?.length) return false;
   const subjects=db.subjects[d.chat] ??= {};
   d.subjectKey ??=randomUUID();
   subjects[d.subjectKey]={subject:d.subject,time:d.time,weekday:d.weekday,teachers:[...d.teachers],project:d.project,auto:d.auto};
-  save();
+  await save();
   return true;
 }
 function joinMenu(d) {
@@ -242,7 +270,7 @@ async function handle(update) {
       const prev=state.history?.pop();
       if(!prev) return;
       state.screen=prev;db.drafts[uid]=structuredClone(prev.draft);db.pending[uid]=structuredClone(prev.pending);
-      save();return panel(uid,prev.text,prev.rows,true);
+      await save();return panel(uid,prev.text,prev.rows,true);
     }
     const command={'nav/profile':'/register','nav/subjects':'/subjects','nav/home':'/start'}[cb.data];
     if(command) {
@@ -262,14 +290,14 @@ async function handle(update) {
       if (current && !current.result && current.id!==draft.key) return personal('В группе уже открыта запись. Сначала завершите её командой /close.');
       const next=current?.id===draft.key ? current : {...draft,id:draft.key,owner:uid,members:{},modern:true};
       db.rooms[draft.chat]=next;
-      save();
+      await save();
       await announce(draft.chat,next);
       const failures=[];
       for (const id of [draft.command,draft.hint].filter(Boolean)) {
         try {await api('deleteMessage',{chat_id:draft.chat,message_id:id});}
         catch(e){if (![400,403].includes(e.code)) throw e; failures.push(id);}
       }
-      delete db.drafts[uid];privateState(uid).history=[];delete privateState(uid).screen;save();
+      delete db.drafts[uid];privateState(uid).history=[];delete privateState(uid).screen;await save();
       return personal('Запись опубликована.'+(failures.includes(draft.command)?' Для удаления /open боту нужны права на удаление сообщений.':''));
   }
   const action = cb?.data || '';
@@ -281,16 +309,16 @@ async function handle(update) {
     if (verb==='scope' && draft.editor) {
       const scope=draft.scopes?.[Number(index)];
       if(!scope) return;
-      draft.chat=scope;draft.key=randomUUID();save();return catalog(draft);
+      draft.chat=scope;draft.key=randomUUID();await save();return catalog(draft);
     }
     if (!groupSelected(draft) && ['publish','month','pick','skip'].includes(verb)) return;
     if (verb==='month' && draft.field==='eventDate') return calendar(draft,Number(index),msg.message_id);
     if (verb==='pick' && draft.field==='eventDate' && validDate(index)) return publishQueue(index);
     if (verb==='time' || (verb==='hour' && draft.field==='time')) {
-      delete db.pending[uid];draft.field='time';save();return clockMenu(draft,verb==='hour'?index:undefined,verb==='hour'?msg.message_id:undefined);
+      delete db.pending[uid];draft.field='time';await save();return clockMenu(draft,verb==='hour'?index:undefined,verb==='hour'?msg.message_id:undefined);
     }
     if(verb==='settime' && draft.field==='time') {
-      draft.time=index;delete draft.field;save();return settings(draft);
+      draft.time=index;delete draft.field;await save();return settings(draft);
     }
     delete db.pending[uid];
     if (verb==='skip' && draft.field==='eventDate') return publishQueue(null);
@@ -301,16 +329,16 @@ async function handle(update) {
       Object.assign(draft,{subject:'',subjectKey:null,auto:null,date:null,time:null,weekday:null,teachers:[],project:false});
       if (verb==='load' && entry) Object.assign(draft,entry[1],{subjectKey:entry[0]});
       draft.key=randomUUID();
-      save();
-      if (verb==='add') {draft.field='subject';save();return personal(prompts.subject);}
+      await save();
+      if (verb==='add') {draft.field='subject';await save();return personal(prompts.subject);}
       return settings(draft);
     }
     if (verb==='day') return menu(draft,'Выберите день недели',[1,2,3,4,5,6,0].map(i=>[button(draft,days[i],'weekday',i)]));
     if (verb==='weekday' && /^[0-6]$/.test(index)) draft.weekday=Number(index);
     if (verb==='publish' || verb==='save') {
-      if (!saveSubject(draft)) return personal('Укажите название, день недели, время и преподавателей.');
+      if (!(await saveSubject(draft))) return personal('Укажите название, день недели, время и преподавателей.');
       if (verb==='save') return catalog(draft);
-      draft.field='eventDate';save();
+      draft.field='eventDate';await save();
       const now=new Date();return calendar(draft,Date.UTC(now.getFullYear(),now.getMonth(),1)/86400000);
     }
     if(verb==='weekly' && Number(draft.chat)<0) return menu(draft,'⏰ Когда открывать запись каждую неделю? Время Екатеринбурга.',[
@@ -325,16 +353,16 @@ async function handle(update) {
       for(const screen of [...(state.history || []),state.screen]) {
         if(screen?.draft?.chat===draft.chat && screen.draft.subjectKey===draft.subjectKey) screen.draft.auto=null;
       }
-      save();return settings(draft);
+      await save();return settings(draft);
     }
     if(verb==='autoDay' && /^[0-6]$/.test(index) && Number(draft.chat)<0) {
-      draft.autoDay=Number(index);draft.field='autoTime';save();return personal('Во сколько открывать запись? Например, 18.20 (Екатеринбург).');
+      draft.autoDay=Number(index);draft.field='autoTime';await save();return personal('Во сколько открывать запись? Например, 18.20 (Екатеринбург).');
     }
     if (verb==='mode') draft.project=!draft.project;
     if (Object.hasOwn(prompts,verb)) {
-      draft.field=verb;save();return personal(prompts[verb]);
+      draft.field=verb;await save();return personal(prompts[verb]);
     }
-    delete draft.field;save();return settings(draft);
+    delete draft.field;await save();return settings(draft);
   }
   if (cb) {
     const [verb,id,slot] = action.split('/');
@@ -361,7 +389,7 @@ async function handle(update) {
           }
         }
       }
-      save();
+      await save();
     }
     return api('answerCallbackQuery',{callback_query_id:cb.id,text:answer,show_alert:true});
   }
@@ -370,14 +398,14 @@ async function handle(update) {
     if (room && !room.result) return send('Запись уже открыта. Итоги — /close.');
     db.organizers ??= {}; (db.organizers[uid] ??= {})[chat]=msg.chat.title || String(chat);
     const d={key:randomUUID(),uid,chat,command:msg.message_id,project:false,teachers:['Преподаватель']};
-    db.drafts[uid]=d;save();
+    db.drafts[uid]=d;await save();
     try {
-      const state=privateState(uid);await removePrivate(uid,state.panel);delete state.panel;state.history=[];delete state.screen;save();
+      const state=privateState(uid);await removePrivate(uid,state.panel);delete state.panel;state.history=[];delete state.screen;await save();
       return await catalog(d);}
     catch(e) {
       if (![400,403].includes(e.code)) throw e;
       const hint=await send('Организатор, откройте бота и нажмите «Старт» для настройки очереди.',{reply_markup:{inline_keyboard:[[{text:'Открыть бота',url:'https://t.me/'+me.username+'?start=q_'+d.key}]]}});
-      d.hint=hint.message_id;save();return;
+      d.hint=hint.message_id;await save();return;
     }
   }
   if (priv && cmd==='/start' && arg?.startsWith('q_')) {
@@ -390,49 +418,49 @@ async function handle(update) {
     if(draft?.command && !draft.editor) groups[draft.chat] ??=String(draft.chat);
     const scopes=['personal-'+uid,...Object.keys(groups)];
     const d={uid,key:randomUUID(),editor:true,chat:scopes[0],scopes};
-    db.drafts[uid]=d;delete db.pending[uid];save();
+    db.drafts[uid]=d;delete db.pending[uid];await save();
     if(scopes.length===1) return catalog(d);
     return menu(d,'📚 Редактор предметов\nВыберите личное расписание или группу.',scopes.map((id,i)=>[button(d,i===0?'Мои предметы':groups[id],'scope',i)]));
   }
   if (priv && (cmd==='/register' || input==='👤 Регистрация')) {
-    db.pending[uid]={step:'name'};save();
+    db.pending[uid]={step:'name'};await save();
     const profile=db.profiles[uid];
     const info=profile ? [participantName(uid,db.telegramNames[uid]),profile.group && 'Группа '+profile.group,profile.topic].filter(Boolean).join(' · ')+'\n\n' : '';
     return personal('👤 Мои данные\n'+info+'Напишите фамилию и имя одним сообщением.');
   }
   if (priv && (cmd==='/start' || cmd==='/help' || input==='🏠 Старт')) {
-    delete db.pending[uid];if(draft) delete draft.field;save();
+    delete db.pending[uid];if(draft) delete draft.field;await save();
     return personal('🎓 Главное меню\n\n👤 Мои данные — изменить профиль для защиты.\n📚 Предметы — настроить расписание и преподавателей.');
   }
   if (priv && db.pending[uid] && !input.startsWith('/')) {
     const pending=db.pending[uid]===true ? (db.pending[uid]={step:'name'}) : db.pending[uid];
     if (pending.step==='name') {
       if (!/^\p{L}[\p{L}\p{M} ’'ʼ-]*\s+\p{L}[\p{L}\p{M} ’'ʼ-]*$/u.test(input) || input.length>100) return personal('Введите фамилию и имя через пробел.');
-      pending.fullName=clean(input);pending.step='group';save();
+      pending.fullName=clean(input);pending.step='group';await save();
       return personal('Введите номер проектной группы цифрами или «-», если не участвуете в проекте.');
     }
     if (pending.step==='group' && input!=='-') {
       if (!/^\d{1,12}$/.test(input)) return personal('Нужен номер группы цифрами, например 3.');
-      pending.group=input.replace(/^0+(?=\d)/,'');pending.step='topic';save();
+      pending.group=input.replace(/^0+(?=\d)/,'');pending.step='topic';await save();
       return personal('Напишите название темы проекта.');
     }
     if (pending.step==='topic' && (!clean(input) || input.length>100)) return personal('Введите тему проекта до 100 символов.');
     db.profiles[uid]={fullName:pending.fullName,group:pending.group,topic:pending.group?clean(input):undefined};
-    delete db.pending[uid];save();return personal('Профиль сохранён.');
+    delete db.pending[uid];await save();return personal('Профиль сохранён.');
   }
   if (priv && draft?.field && !input.startsWith('/')) {
     const f=draft.field;
     if (!clean(input)) return personal(prompts[f]);
     if(f==='autoTime') {
       if(!/^([01]?\d|2[0-3])[:.][0-5]\d$/.test(input)) return personal('Введите время, например 18:20.');
-      draft.autoTime=input.replace('.',':').padStart(5,'0');draft.field='autoHours';save();
+      draft.autoTime=input.replace('.',':').padStart(5,'0');draft.field='autoHours';await save();
       return personal('Через сколько часов закрыть запись и опубликовать результат? Введите от 1 до 167.');
     }
     if(f==='autoHours') {
       const hours=Number(input);
       if(!Number.isInteger(hours)||hours<1||hours>167) return personal('Введите целое число часов от 1 до 167.');
       draft.auto={day:draft.autoDay,time:draft.autoTime,hours,owner:uid,since:Date.now()};
-      delete draft.field;save();return settings(draft);
+      delete draft.field;await save();return settings(draft);
     }
     if (f==='eventDate') {
       const date=shortDate(input);
@@ -442,18 +470,18 @@ async function handle(update) {
     if (f==='subject' && input.length<=80) draft.subject=clean(input);
     else if (f==='time' && /^([01]?\d|2[0-3])[:.][0-5]\d$/.test(input)) draft.time=input.replace('.',':').padStart(5,'0');
     else if (f==='count' && /^([1-9]|10)$/.test(input)) {
-      draft.count=Number(input);draft.newTeachers=[];draft.field='teacher';save();
+      draft.count=Number(input);draft.newTeachers=[];draft.field='teacher';await save();
       return personal('Введите ФИО преподавателя 1 из '+draft.count+'.');
     } else if (f==='teacher') {
       const name=clean(input);
       if (input.length>80 || !name || draft.newTeachers.includes(name)) return personal('Введите отдельное ФИО до 80 символов без повторов.');
       draft.newTeachers.push(name);
       if (draft.newTeachers.length<draft.count) {
-        save();return personal('Введите ФИО преподавателя '+(draft.newTeachers.length+1)+' из '+draft.count+'.');
+        await save();return personal('Введите ФИО преподавателя '+(draft.newTeachers.length+1)+' из '+draft.count+'.');
       }
       draft.teachers=draft.newTeachers;delete draft.newTeachers;
     } else return personal(prompts[f] || 'Выберите поле в карточке предмета.');
-    delete draft.field;save();return settings(draft);
+    delete draft.field;await save();return settings(draft);
   }
   if (priv) return personal('🎓 Главное меню\nВыберите профиль или предметы.');
   if (cmd==='/help' || cmd==='/register' || cmd==='/start') return send(help);
@@ -475,7 +503,7 @@ async function finish(chat,room,repeat=false) {
       const names=[...entries.values()];shuffle(names);
       return [teacher,...(names.length?names.map((n,i)=>(i+1)+'. '+n):['Никто не записался'])].join('\n');
     });
-    room.formatted=true;room.pendingResult=true;save();
+    room.formatted=true;room.pendingResult=true;await save();
   }
   const lines=room.modern || room.formatted ? room.result.join('\n\n').split('\n') : room.result.map((n,i)=>(i+1)+'. '+n);
   let page='🏁 Запись закрыта'+(room.subject?' · '+room.subject:'');
@@ -487,18 +515,18 @@ async function finish(chat,room,repeat=false) {
   pages.push(page);
   for(let i=repeat?0:(room.sentPages || 0);i<pages.length;i++){
     await api('sendMessage',{chat_id:chat,text:pages[i]});
-    if(!repeat){room.sentPages=i+1;save();}
+    if(!repeat){room.sentPages=i+1;await save();}
   }
   if(room.post && !room.delivered) {
     try {await api('editMessageReplyMarkup',{chat_id:chat,message_id:room.post,reply_markup:{inline_keyboard:[]}});}
     catch(e){if(![400,403].includes(e.code)) throw e;}
   }
-  room.delivered=true;room.pendingResult=false;save();
+  room.delivered=true;room.pendingResult=false;await save();
 }
 async function announce(chat,room) {
   if(room.post) return;
   const post=await api('sendMessage',{chat_id:chat,text:summary(room)+'\nВыберите, к кому записаться.',reply_markup:joinMenu(room)});
-  room.post=post.message_id;save();
+  room.post=post.message_id;await save();
 }
 function weeklyStart(now,auto) {
   const local=new Date(now+5*3600000);
@@ -524,7 +552,7 @@ async function tick(now=Date.now()) {
       if(start<auto.since || now>=end || runs[slot]===start) continue;
       if(db.rooms[chat] && !db.rooms[chat].result) continue;
       const room={...t,modern:true,id:randomUUID(),owner:auto.owner,members:{},closeAt:end};
-      db.rooms[chat]=room;runs[slot]=start;save();
+      db.rooms[chat]=room;runs[slot]=start;await save();
       await announce(chat,room);
     }
   }
@@ -545,14 +573,14 @@ while (true) {
         const privateMessage=incoming?.chat.type==='private';
         if(privateMessage && /^\/start(?:@\w+)?(?:\s|$)/i.test(incoming.text || '')) {
           privateState(incoming.chat.id).firstStart ??=incoming.message_id;
-          save();
+          await save();
         }
         await handle(update);
         if(privateMessage) await removePrivate(incoming.chat.id,incoming.message_id);
       }
       catch (e) {if (![400,403].includes(e.code)) throw e; console.error(e.message);}
       db.offset=update.update_id+1;
-      save();
+      await save();
     }
   } catch (e) {console.error(e.message);await sleep(3000);}
 }
